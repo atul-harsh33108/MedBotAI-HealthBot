@@ -4,5 +4,7 @@ google-generativeai
 langchain
 langchain-community
 langchain-openai
+langchain-google-genai
+langchain-anthropic
 langgraph
 tavily-python
