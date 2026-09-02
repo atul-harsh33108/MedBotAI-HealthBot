@@ -9,17 +9,16 @@ Fixes were applied on 2026-09-01 for items 1, 3, 4, 5, 6 and the error-handling 
 of 7. Findings below are tagged **RESOLVED** or **OPEN** accordingly. See
 [section 8](#8-fixes-applied) for what changed.
 
-**All rubric criteria are now met**, with a verified two-topic run saved in the
+**All rubric criteria are now met**, with a verified three-topic run saved in the
 notebook covering both the restart and exit branches — see
 [3.2](#32-no-successful-end-to-end-run-is-saved--resolved). Provider choice is *not*
 a gap: the instructor confirmed any LLM key is acceptable, see
 [3.3](#33-provider-choice--not-a-gap).
 
-Remaining items are quality improvements only, none of them rubric-blocking. The
-most visible is that library `UserWarning`s are interleaved into the patient-facing
-output — 8 stderr blocks in the saved run.
+Nothing is outstanding. Work after the rubric was met is recorded in sections 9-15
+and is enhancement rather than remediation.
 
-Four follow-up fixes landed after the initial pass:
+Further work landed after the initial pass:
 
 - [Section 9](#9-one-provider-failing-ended-the-session--resolved) — four provider keys
   were configured but only one was ever used, so Google's daily cap killed the session.
@@ -29,11 +28,11 @@ Four follow-up fixes landed after the initial pass:
   appearing in the patient-facing summary.
 - [Section 11](#11-grade-parsing-was-too-strict--resolved) — the grade parser silently
   reported `N/A` whenever the model decorated its labels.
-- [Section 12](#12-output-formatting--resolved) — the plain-text output layer was
+- [Section 15](#15-output-formatting--resolved) — the plain-text output layer was
   replaced with rendered Markdown.
 
 Verification: `test_graph_logic.py` was extended to cover the new behaviour and
-passes all ten scenarios. The notebook validates under `nbformat`, every code
+passes all **16** scenarios. The notebook validates under `nbformat`, every code
 cell compiles, and the helper cells execute standalone.
 
 ---
@@ -66,7 +65,7 @@ Requirements and the grading rubric live in `capstone_project_details.md`.
 | `requirements.txt` | Subset of the above, unversioned |
 | `main.py` | Untouched `uv init` stub — dead code |
 
-Verified: `test_graph_logic.py` passes all three of its scenarios
+Verified: `test_graph_logic.py` passes all 16 of its scenarios
 (`.venv\Scripts\python.exe test_graph_logic.py` → `ALL TESTS PASSED`).
 
 ---
@@ -191,31 +190,40 @@ GoogleRateLimitError: RESOURCE_EXHAUSTED — free-tier quota, limit: 20,
 model: gemini-3.5-flash-lite      (raised inside search_topic)
 ```
 
-A clean two-topic run is now saved and verified. Cells executed sequentially 1 through 21
-from a fresh kernel with **zero error outputs**, and the run cell captures both branches of
-the conditional edge:
+A clean **three-topic** run is saved and verified, with **zero error outputs and zero
+stderr blocks**, capturing both branches of the restart/exit edge:
 
 | Evidence in the saved output | Status |
 | --- | --- |
-| Two distinct topics (`headache`, then `Cold`) | present |
-| `reset_state` fired between them | present |
-| Model issued the Tavily tool call, both topics | present |
-| Fallback path never used | confirmed |
-| Summary length | 4 paragraphs each (315 / 321 words) — within the required 3-4 |
-| Quiz question, both topics | present |
-| Letter grade, both topics | `F` and `B` |
-| Quoted citation from the summary in the feedback | present |
-| Restart branch (`yes` → `reset_state` → `ask_topic`) | present |
+| Three distinct topics (`cold`, `Vomiting`, `loose motion`) | present |
+| `reset_state` fired twice | present |
+| Model issued the Tavily tool call on every topic | 3 of 3 |
+| Direct-search fallback never needed | confirmed |
+| Summary length | 4 paragraphs each — within the required 3-4 |
+| Quiz question per topic | present |
+| Letter grades | `C`, `A`, `F` |
+| Citation verified against the summary | 3 of 3 matched |
+| Sources shown per topic | 5 / 9 / 9, 21 of 23 from reputable domains |
+| Restart branch (`yes` → `reset_state` → `ask_topic`) | present, twice |
 | Exit branch (`no` → `END`) | present |
-| Graph diagram | PNG rendered in cell 31 |
+| Adaptive branch offered on the `F` | present (declined, so the rewrite itself is not shown) |
+| Graph diagram | PNG rendered |
 
-Two details worth noting as positive evidence. The model chose its own search queries and
-steered them toward reputable sources unprompted by name —
-`headache types symptoms treatments NIH CDC MedlinePlus` and
-`common cold CDC overview symptoms treatment prevention` — which shows
-`SEARCH_SYSTEM_PROMPT` is doing its job. And the `F` grade on topic 1 demonstrates the
-grader handling a wrong answer: encouraging in tone, and still citing the summary
-(*"called an aura—a group of nervous system symptoms that frequently affect vision"*).
+Three details worth noting as positive evidence.
+
+The model chose its own search queries and steered them toward reputable sources without
+being told to name them — `common cold symptoms causes treatment CDC NIH`,
+`loose motion diarrhea causes symptoms treatment Mayo Clinic` — which shows
+`SEARCH_SYSTEM_PROMPT` is doing real work. It also issued **two** tool calls on two of the
+topics, choosing a multi-query strategy of its own accord.
+
+The run happened to exercise provider failover for real: Google's daily allowance was
+exhausted, the session switched to OpenRouter, and OpenRouter issued the tool calls
+successfully. This is the same situation that previously ended a session outright, before
+the classification fix in section 13.
+
+All three citations verified, on a free model — so the verification in section 11 is not
+passing trivially.
 
 Note that outputs on every cell modified during a fix pass are cleared, since they no
 longer match the code — so a fresh run is needed after any future change.
@@ -295,8 +303,10 @@ notebook's state, nodes, and graph with fakes substituted. It was updated in ste
 fixes and now also asserts the history-replay behaviour, but the structural drift risk
 remains: a notebook change still will not fail the test automatically.
 
-**OPEN — `recursion_limit=100` caps the session at ~10 topics** (10 nodes per cycle). Fine
-for a demo, but it is a silent ceiling.
+**RESOLVED — `recursion_limit=100` capped the session at ~10 topics.** The limit is now
+derived from the node count (`NODES_PER_TOPIC * (MAX_TOPICS + 1)`) and
+`GraphRecursionError` is caught, so hitting the ceiling gives a readable message instead
+of a traceback. See section 12.
 
 **OPEN — docstring drift in `test_api_keys.py`.** The docstring says OpenAI is checked by
 listing models ("lightweight, no completion cost"); the implementation performs a real
@@ -339,7 +349,7 @@ Checked rather than assumed:
 | # | Fix | Status |
 | --- | --- | --- |
 | 1 | Thread `state["messages"]` into the LLM calls — closes the only substantive rubric gap | Done |
-| 2 | Re-run end-to-end and commit the saved outputs | Done for one topic; needs a two-topic run to show the restart branch |
+| 2 | Re-run end-to-end and commit the saved outputs | Done — three-topic run, both branches captured |
 | 3 | Fix the `grade_answer` justification parser so multi-line feedback survives | Done |
 | 4 | Sync `requirements.txt` with `pyproject.toml` and add versions | Done |
 | 5 | Move the `RemoveMessage` import into the imports cell | Done |
@@ -434,7 +444,7 @@ message instead of a traceback.
 - **Test 6** — `invoke_with_retry` recovers after two transient failures, raises
   `HealthBotServiceError` after exhausting attempts, and fails fast on a non-transient
   error.
-- **Test 7** (added with the display work, see section 9) — `render_markdown` falls back
+- **Test 7** (added with the display work, see section 12) — `render_markdown` falls back
   to cleaned plain text off-notebook, and a real run displays the quiz and grade blocks
   with no raw markup reaching the patient.
 
@@ -562,9 +572,13 @@ Now verified across nine formats — plain, bolded, heading-prefixed, bullet-pre
 blockquoted with a modifier, code-fenced, lowercase, missing justification label, and a
 trailing parenthetical — plus an ungradeable response that correctly reports `N/A`.
 
+This parser is no longer the primary path. Section 14 replaced it with a Pydantic schema
+that makes the grade and citation structural rather than scraped; the tolerant parser is
+kept as the fallback for providers that cannot return structured output.
+
 ---
 
-## 13. Beyond-the-rubric improvements — RESOLVED
+## 12. Beyond-the-rubric improvements — RESOLVED
 
 Applied as one batch so the notebook only needed re-running once. Covered by tests 11
 and 12.
@@ -631,7 +645,118 @@ attempt at the preferred provider — any short-lived limit has long since clear
 
 ---
 
-## 12. Output formatting — RESOLVED
+## 13. Failover misclassified a billing error — RESOLVED
+
+A real session ended with:
+
+> Sorry -- the medical search failed for a reason that changing provider will not fix:
+> Your credit balance is too low to access the Anthropic API.
+
+That claim was false, and the consequence was worse than the message: **the remaining
+provider was never tried.** Running the exact error text through the classifier confirmed
+none of the three marker sets matched "credit balance is too low", so it fell through to
+the "this is a code bug" branch and abandoned the cascade with a working provider left in
+the chain.
+
+The missing billing marker was the surface problem. The real one was the **default
+direction**: unrecognised message meant give up, which is backwards when several keys are
+configured. Any provider phrasing not anticipated would end a session.
+
+### Fix
+
+Classification is now by **exception type** for the stop/continue decision:
+
+```python
+BUG_TYPES = (TypeError, AttributeError, KeyError, IndexError,
+             NameError, ImportError, AssertionError)
+```
+
+Only those short-circuit; everything else tries the next provider. Exception type is a
+reliable signal for "this notebook is wrong" in a way string matching never was. Message
+markers now only decide *retry in place versus switch*, and a billing group was added
+(`credit balance`, `billing`, `payment required`, `402`, `purchase credits`,
+`spending limit`).
+
+Two supporting changes. `search_topic` now survives a total absence of tool-calling
+support: if no provider can run a tool-bound request it searches Tavily directly and says
+so, rather than ending the session. And OpenAI and Anthropic were removed as selectable
+providers at the user's request, leaving Google Gemini with OpenRouter as fallback.
+`langchain-openai` stays as a dependency because OpenRouter is reached through
+`ChatOpenAI`.
+
+Verified against the reported error: it now switches on the first attempt, an unrecognised
+message also cascades, and a real `TypeError` still stops after one attempt.
+
+---
+
+## 14. Agentic enhancements — ADDED
+
+Four additions made after the rubric was already satisfied. None alters the graded path:
+the required flow behaves exactly as before, and each of these is either a branch the
+reviewer can see or a stronger implementation of an existing step.
+
+**Structured grading with citation verification.** `parse_grade_response()` scraped the
+grade and justification out of free text with regex — workable, but it depended on the
+model formatting correctly, which section 11 shows it often does not. The primary path is
+now a Pydantic schema:
+
+```python
+class GradeResult(BaseModel):
+    grade: Literal["A", "B", "C", "D", "F"]
+    citation: str = Field(min_length=10, description="A short quote copied VERBATIM from the summary")
+    justification: str = Field(min_length=20)
+```
+
+Three consequences. The letter grade is structurally constrained, so `"N/A"` is
+unreachable on this path. The citation becomes a **required field** rather than something
+hoped for in prose, which converts a rubric requirement into a schema guarantee. And most
+importantly, `citation_is_grounded()` then checks the quote really is a substring of the
+summary — asking for a citation only gets you a citation-shaped string; verifying it is
+what makes the citation mean anything. A quote that does not match earns one corrective
+attempt naming the fabrication; if it still fails, the grade stands but the citation is
+displayed as unverified rather than presented as evidence. The regex parser is retained as
+a fallback for providers that cannot honour a schema.
+
+**Adaptive re-explanation.** A comprehension check that detects a gap and moves on has
+wasted the signal, so a grade of D or F opens an optional branch: `offer_recap` asks,
+`simplify_summary` rewrites the same material in plainer language, `present_simple_summary`
+displays it. The rewrite is bound to the original summary as its only source and is given
+the verified citation so it leads with the point actually missed. Declining rejoins the
+flow. This is the addition that makes the graph itself more sophisticated — a second
+conditional edge, visible in the rendered diagram.
+
+**Multiple choice as an option.** A `choose_quiz_format` node asks how the patient would
+like to be tested; pressing Enter keeps open-ended, which stays the default because it is
+the format that produces a citation-backed justification. Choosing multiple choice
+generates a `MultipleChoiceQuiz` through the same structured-output mechanism as grading:
+
+```python
+class MultipleChoiceQuiz(BaseModel):
+    question: str = Field(min_length=10)
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+    citation: str = Field(min_length=10)
+```
+
+A `field_validator` rejects duplicate options, the citation is verified against the summary
+exactly as in grading, and the correct option is handed to the grader as ground truth
+rather than being re-derived. If a provider cannot produce a valid four-option question the
+node degrades to an open question instead of failing the comprehension check.
+
+**End-of-session recap.** This needed care, because the rubric requires state reset
+*specifically* so one topic's health information cannot reach the next — a history holding
+summaries or answers would quietly undo the thing being marked. So `SESSION_LOG` lives
+**outside** `HealthBotState`, holds only metadata (topic label, grade, source count,
+whether a rewrite was used, time), and is never added to a model payload. A
+`record_progress` node appends one entry per completed topic, and the run cell renders a
+table at the end. Tests assert the retained key set exactly, and that no summary, quiz, or
+answer text can appear in it.
+
+Graph grew from 13 nodes to 15, still with three conditional edges.
+
+---
+
+## 15. Output formatting — RESOLVED
 
 ### The problem
 

@@ -22,6 +22,9 @@ scripted queue of patient responses. It verifies:
  11. Grade parsing tolerates the decorated label formats models actually emit.
  12. Provider failover: a daily cap or provider error switches to the next
      configured key, transient limits retry in place, and the switch sticks.
+ 13. Multiple choice is offered alongside open-ended, validates four distinct
+     options, and degrades to an open question if the schema cannot be met.
+ 14. The end-of-session recap retains metadata only and never enters a prompt.
 
 Run with:
     .venv\\Scripts\\python.exe test_graph_logic.py
@@ -33,12 +36,13 @@ import io
 import re
 import sys
 import time
+from datetime import datetime
 from typing import Annotated, Literal, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages, RemoveMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +56,10 @@ class HealthBotState(TypedDict):
     search_sources: Optional[list[str]]
     search_results: Optional[str]
     summary: Optional[str]
+    quiz_format: Optional[str]
     quiz_question: Optional[str]
+    quiz_options: Optional[list[str]]
+    quiz_correct_index: Optional[int]
     patient_answer: Optional[str]
     grade: Optional[str]
     feedback: Optional[str]
@@ -73,7 +80,10 @@ class HealthBotUpdate(TypedDict, total=False):
     search_sources: Optional[list[str]]
     search_results: Optional[str]
     summary: Optional[str]
+    quiz_format: Optional[str]
     quiz_question: Optional[str]
+    quiz_options: Optional[list[str]]
+    quiz_correct_index: Optional[int]
     patient_answer: Optional[str]
     grade: Optional[str]
     feedback: Optional[str]
@@ -302,6 +312,22 @@ class GradeResult(BaseModel):
     justification: str = Field(min_length=20)
 
 
+class MultipleChoiceQuiz(BaseModel):
+    """A four-option question answerable from the summary alone."""
+
+    question: str = Field(min_length=10)
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+    citation: str = Field(min_length=10)
+
+    @field_validator("options")
+    @classmethod
+    def _must_be_distinct(cls, options: list[str]) -> list[str]:
+        if len({option.strip().lower() for option in options}) != len(options):
+            raise ValueError("options must be distinct")
+        return options
+
+
 def _normalise_quote(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").lower()).strip(" \"'`.,;:!?-")
 
@@ -470,6 +496,26 @@ class FakeSchemaUnsupported:
     def invoke(self, messages):
         raise NotImplementedError("structured output not supported by this provider")
 
+
+class FakeMCQLLM:
+    """Simulates a provider honouring with_structured_output(MultipleChoiceQuiz)."""
+
+    citations: list = []
+    correct_index = 0
+    calls = 0
+
+    def invoke(self, messages):
+        FakeMCQLLM.calls += 1
+        FakeGenericLLM.payloads["mcq"] = messages
+        pool = FakeMCQLLM.citations or [FAKE_CITATION]
+        citation = pool[0] if len(pool) == 1 else pool.pop(0)
+        return MultipleChoiceQuiz(
+            question="What does diabetes affect?",
+            options=["Blood sugar", "Eyesight only", "Hearing", "Bone density"],
+            correct_index=FakeMCQLLM.correct_index,
+            citation=citation,
+        )
+
 # Bolded labels and a justification spanning several lines: the shape models
 # actually produce, which the original parser could not read.
 FAKE_GRADE_RESPONSE = (
@@ -551,6 +597,14 @@ QUIZ_SYSTEM_PROMPT = "Write ONE clear, specific single comprehension-check quest
 GRADE_SYSTEM_PROMPT = "You are HealthBot, grading a patient's answer"
 
 visited_nodes = []
+
+# The node sequence a topic follows before any branching, kept in one place so
+# every path assertion stays in step with the graph.
+MAIN_PATH = ["ask_topic", "search_topic", "summarize_results", "present_summary",
+             "choose_quiz_format", "generate_quiz", "ask_quiz_question",
+             "grade_answer", "present_grade"]
+# A passing grade goes straight to recording progress and asking about a new topic.
+DIRECT_PATH = MAIN_PATH + ["record_progress", "ask_continue"]
 
 
 def ask_topic(state: HealthBotState) -> HealthBotUpdate:
@@ -672,19 +726,88 @@ def present_summary(state: HealthBotState) -> HealthBotUpdate:
     return {}
 
 
+MCQ_SYSTEM_PROMPT = "multiple-choice comprehension question"
+
+
+def choose_quiz_format(state: HealthBotState) -> HealthBotUpdate:
+    visited_nodes.append("choose_quiz_format")
+    render_markdown("**Ready for a quick comprehension check.** How would you like to be tested?")
+    while True:
+        choice = builtins.input("Choose 1 or 2 (press Enter for 1): ").strip()
+        if choice in ("", "1"):
+            return {"quiz_format": "open"}
+        if choice == "2":
+            return {"quiz_format": "mcq"}
+        print("  Please enter 1 or 2.")
+
+
 def generate_quiz(state: HealthBotState) -> HealthBotUpdate:
     visited_nodes.append("generate_quiz")
-    prompt = f"Summary:\n{state['summary']}"
+    summary = state["summary"]
+
+    if state.get("quiz_format") == "mcq":
+        prompt = f"Summary:\n{summary}"
+
+        def structured(extra: str = ""):
+            return invoke_model(
+                build_model_payload(
+                    MCQ_SYSTEM_PROMPT, state, prompt + extra, include_search_results=False
+                ),
+                what="the quiz question",
+                schema=MultipleChoiceQuiz,
+            )
+
+        try:
+            quiz = structured()
+            if not citation_is_grounded(quiz.citation, summary):
+                quiz = structured("\n\nQuote verbatim from the summary.")
+            transcript = quiz.question + "\n" + "\n".join(
+                f"{n}. {opt}" for n, opt in enumerate(quiz.options, start=1)
+            )
+            return {
+                "quiz_question": quiz.question,
+                "quiz_options": quiz.options,
+                "quiz_correct_index": quiz.correct_index,
+                "messages": [AIMessage(content=transcript)],
+            }
+        except Exception:
+            render_markdown("_Multiple choice wasn't available just now, so here's an open question instead._")
+
+    prompt = f"Summary:\n{summary}"
     response = invoke_model(
         build_model_payload(QUIZ_SYSTEM_PROMPT, state, prompt, include_search_results=False),
         what="the quiz question",
     )
     quiz_question = message_text(response)
-    return {"quiz_question": quiz_question, "messages": [AIMessage(content=quiz_question)]}
+    return {
+        "quiz_question": quiz_question,
+        "quiz_options": None,
+        "quiz_correct_index": None,
+        "messages": [AIMessage(content=quiz_question)],
+    }
 
 
 def ask_quiz_question(state: HealthBotState) -> HealthBotUpdate:
     visited_nodes.append("ask_quiz_question")
+    options = state.get("quiz_options")
+
+    if options:
+        render_markdown(
+            "### Comprehension check\n\n"
+            f"{state['quiz_question']}\n\n"
+            + "\n".join(f"{n}. {option}" for n, option in enumerate(options, start=1))
+        )
+        while True:
+            raw = builtins.input(f"Your answer (1-{len(options)}): ").strip()
+            if raw.isdigit() and 1 <= int(raw) <= len(options):
+                answer = options[int(raw) - 1]
+                break
+            print(f"  Please enter a number from 1 to {len(options)}.")
+        return {
+            "patient_answer": answer,
+            "messages": [HumanMessage(content=f"My answer: {answer}")],
+        }
+
     render_markdown(f"### Comprehension check\n\n{state['quiz_question']}")
     answer = builtins.input("Your answer: ").strip()
     while not answer:
@@ -695,7 +818,19 @@ def ask_quiz_question(state: HealthBotState) -> HealthBotUpdate:
 def grade_answer(state: HealthBotState) -> HealthBotUpdate:
     visited_nodes.append("grade_answer")
     summary = state["summary"]
-    prompt = f"Summary:\n{summary}\n\nPatient's answer: {state['patient_answer']}"
+    prompt = (
+        f"Summary:\n{summary}\n\n"
+        f"Quiz question: {state['quiz_question']}\n\n"
+        f"Patient's answer: {state['patient_answer']}"
+    )
+
+    options = state.get("quiz_options")
+    index = state.get("quiz_correct_index")
+    if options and index is not None and 0 <= index < len(options):
+        prompt += (
+            "\n\nThis was a multiple-choice question. The correct option was: "
+            f"{options[index]!r}. Grade the patient's selection against it."
+        )
 
     def structured(extra: str = ""):
         return invoke_model(
@@ -770,7 +905,7 @@ LOW_GRADES = {"D", "F"}
 
 def route_after_grade(state: HealthBotState) -> str:
     grade = (state.get("grade") or "").strip().upper()
-    return "offer_recap" if grade[:1] in LOW_GRADES else "ask_continue"
+    return "offer_recap" if grade[:1] in LOW_GRADES else "record_progress"
 
 
 def offer_recap(state: HealthBotState) -> HealthBotUpdate:
@@ -780,7 +915,7 @@ def offer_recap(state: HealthBotState) -> HealthBotUpdate:
 
 
 def route_recap(state: HealthBotState) -> str:
-    return "simplify_summary" if state.get("wants_simpler") else "ask_continue"
+    return "simplify_summary" if state.get("wants_simpler") else "record_progress"
 
 
 SIMPLIFY_SYSTEM_PROMPT = "explain the same material again more simply"
@@ -806,6 +941,68 @@ def present_simple_summary(state: HealthBotState) -> HealthBotUpdate:
     return {}
 
 
+SESSION_LOG: list[dict] = []
+
+
+def record_progress(state: HealthBotState) -> HealthBotUpdate:
+    visited_nodes.append("record_progress")
+    SESSION_LOG.append(
+        {
+            "topic": state.get("topic") or "(unnamed)",
+            "format": "multiple choice" if state.get("quiz_options") else "open question",
+            "grade": state.get("grade") or "N/A",
+            "citation_verified": state.get("citation_verified"),
+            "sources": len(state.get("search_sources") or []),
+            "simplified": bool(state.get("simple_summary")),
+            "at": datetime.now().strftime("%H:%M"),
+        }
+    )
+    return {}
+
+
+def render_session_recap() -> None:
+    """Mirror of the notebook's recap renderer."""
+    if not SESSION_LOG:
+        return
+
+    topics = len(SESSION_LOG)
+    graded = [e["grade"] for e in SESSION_LOG if e["grade"] != "N/A"]
+    sources = sum(e["sources"] for e in SESSION_LOG)
+    verified = sum(1 for e in SESSION_LOG if e["citation_verified"] is True)
+    simplified = sum(1 for e in SESSION_LOG if e["simplified"])
+
+    lines = [
+        "### Session summary",
+        "",
+        f"You covered **{topics} topic{'s' if topics != 1 else ''}** and "
+        f"**{sources} source{'s' if sources != 1 else ''}** were consulted.",
+        "",
+        "| Time | Topic | Check | Grade | Sources | Simpler recap |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for entry in SESSION_LOG:
+        lines.append(
+            f"| {entry['at']} | {entry['topic']} | {entry['format']} | "
+            f"{entry['grade']} | {entry['sources']} | "
+            f"{'yes' if entry['simplified'] else 'no'} |"
+        )
+
+    lines += ["", f"Grades: {', '.join(graded) if graded else 'none recorded'}."]
+    if verified:
+        lines.append(
+            f"{verified} of {topics} feedback citations were checked back against the summary."
+        )
+    if simplified:
+        lines.append(f"{simplified} topic(s) included a plainer re-explanation.")
+    lines += [
+        "",
+        "_Only topic titles and scores are kept for this recap. Summaries, questions "
+        "and your answers are discarded between topics._",
+    ]
+
+    render_markdown("\n".join(lines))
+
+
 def ask_continue(state: HealthBotState) -> HealthBotUpdate:
     visited_nodes.append("ask_continue")
     return {"continue_session": ask_yes_no("Another topic? (yes/no): ")}
@@ -827,7 +1024,10 @@ def reset_state(state: HealthBotState) -> HealthBotUpdate:
         "search_sources": None,
         "search_results": None,
         "summary": None,
+        "quiz_format": None,
         "quiz_question": None,
+        "quiz_options": None,
+        "quiz_correct_index": None,
         "patient_answer": None,
         "grade": None,
         "feedback": None,
@@ -848,6 +1048,7 @@ def build_graph():
     gb.add_node("search_topic", search_topic)
     gb.add_node("summarize_results", summarize_results)
     gb.add_node("present_summary", present_summary)
+    gb.add_node("choose_quiz_format", choose_quiz_format)
     gb.add_node("generate_quiz", generate_quiz)
     gb.add_node("ask_quiz_question", ask_quiz_question)
     gb.add_node("grade_answer", grade_answer)
@@ -855,6 +1056,7 @@ def build_graph():
     gb.add_node("offer_recap", offer_recap)
     gb.add_node("simplify_summary", simplify_summary)
     gb.add_node("present_simple_summary", present_simple_summary)
+    gb.add_node("record_progress", record_progress)
     gb.add_node("ask_continue", ask_continue)
     gb.add_node("reset_state", reset_state)
 
@@ -862,16 +1064,18 @@ def build_graph():
     gb.add_edge("ask_topic", "search_topic")
     gb.add_edge("search_topic", "summarize_results")
     gb.add_edge("summarize_results", "present_summary")
-    gb.add_edge("present_summary", "generate_quiz")
+    gb.add_edge("present_summary", "choose_quiz_format")
+    gb.add_edge("choose_quiz_format", "generate_quiz")
     gb.add_edge("generate_quiz", "ask_quiz_question")
     gb.add_edge("ask_quiz_question", "grade_answer")
     gb.add_edge("grade_answer", "present_grade")
     gb.add_conditional_edges("present_grade", route_after_grade,
-                             {"offer_recap": "offer_recap", "ask_continue": "ask_continue"})
+                             {"offer_recap": "offer_recap", "record_progress": "record_progress"})
     gb.add_conditional_edges("offer_recap", route_recap,
-                             {"simplify_summary": "simplify_summary", "ask_continue": "ask_continue"})
+                             {"simplify_summary": "simplify_summary", "record_progress": "record_progress"})
     gb.add_edge("simplify_summary", "present_simple_summary")
-    gb.add_edge("present_simple_summary", "ask_continue")
+    gb.add_edge("present_simple_summary", "record_progress")
+    gb.add_edge("record_progress", "ask_continue")
     gb.add_conditional_edges("ask_continue", route_continue, {"reset_state": "reset_state", END: END})
     gb.add_edge("reset_state", "ask_topic")
 
@@ -882,7 +1086,8 @@ captured_output = io.StringIO()
 
 
 def run_test(scripted_inputs, use_fallback=False, structured=True,
-             grade="B", citations=None):
+             grade="B", citations=None, quiz_format="open", mcq_ok=True,
+             mcq_correct_index=0):
     global llm_with_tavily, captured_output, _get_model, _active_provider, FAILOVER_ORDER
     llm_with_tavily = FakeNoToolCallLLM() if use_fallback else FakeToolCallLLM()
 
@@ -891,6 +1096,11 @@ def run_test(scripted_inputs, use_fallback=False, structured=True,
     FakeStructuredLLM.calls = 0
     grader = FakeStructuredLLM() if structured else FakeSchemaUnsupported()
 
+    FakeMCQLLM.citations = [FAKE_CITATION]
+    FakeMCQLLM.correct_index = mcq_correct_index
+    FakeMCQLLM.calls = 0
+    mcq_model = FakeMCQLLM() if mcq_ok else FakeSchemaUnsupported()
+
     # Single fake provider for the graph tests; failover itself is TEST 10.
     FAILOVER_ORDER = ["1"]
     _active_provider = 0
@@ -898,18 +1108,28 @@ def run_test(scripted_inputs, use_fallback=False, structured=True,
     def fake_get_model(key, with_tools, schema=None):
         if with_tools:
             return llm_with_tavily
-        return grader if schema is not None else llm
+        if schema is MultipleChoiceQuiz:
+            return mcq_model
+        if schema is not None:
+            return grader
+        return llm
 
     _get_model = fake_get_model
 
     visited_nodes.clear()
     FakeTavilyTool.call_log.clear()
     FakeGenericLLM.payloads.clear()
+    SESSION_LOG.clear()
     captured_output = io.StringIO()
 
     input_queue = list(scripted_inputs)
 
     def fake_input(prompt=""):
+        # The quiz-format prompt is answered from the `quiz_format` argument
+        # rather than from the script, so every input list stays readable and
+        # focused on the patient's actual answers.
+        if "Choose 1 or 2" in prompt:
+            return "2" if quiz_format == "mcq" else ""
         return input_queue.pop(0)
 
     original_input = builtins.input
@@ -920,7 +1140,9 @@ def run_test(scripted_inputs, use_fallback=False, structured=True,
             "messages": [], "topic": None, "search_queries": None,
             "search_used_tool_call": None, "search_sources": None,
             "search_results": None, "summary": None,
-            "quiz_question": None, "patient_answer": None, "grade": None,
+            "quiz_format": None, "quiz_question": None, "quiz_options": None,
+            "quiz_correct_index": None,
+            "patient_answer": None, "grade": None,
             "feedback": None, "citation": None, "citation_verified": None,
             "wants_simpler": None, "simple_summary": None,
             "continue_session": None,
@@ -943,10 +1165,7 @@ def main():
         scripted_inputs=["diabetes", "", "it affects blood sugar", "no"],
         use_fallback=False,
     )
-    assert visited_nodes == [
-        "ask_topic", "search_topic", "summarize_results", "present_summary",
-        "generate_quiz", "ask_quiz_question", "grade_answer", "present_grade", "ask_continue",
-    ], f"Unexpected node path: {visited_nodes}"
+    assert visited_nodes == DIRECT_PATH, f"Unexpected node path: {visited_nodes}"
     assert final_state["grade"] == "B", f"Expected grade B, got {final_state['grade']}"
     assert "Diabetes is a chronic condition" in final_state["feedback"]
     assert FakeTavilyTool.call_log == ["diabetes"], f"Expected forced tool-call search, got {FakeTavilyTool.call_log}"
@@ -1019,13 +1238,7 @@ def main():
         ],
         use_fallback=False,
     )
-    expected_path = (
-        ["ask_topic", "search_topic", "summarize_results", "present_summary",
-         "generate_quiz", "ask_quiz_question", "grade_answer", "present_grade", "ask_continue"]
-        + ["reset_state"]
-        + ["ask_topic", "search_topic", "summarize_results", "present_summary",
-           "generate_quiz", "ask_quiz_question", "grade_answer", "present_grade", "ask_continue"]
-    )
+    expected_path = DIRECT_PATH + ["reset_state"] + DIRECT_PATH
     assert visited_nodes == expected_path, f"Unexpected node path: {visited_nodes}"
     assert final_state["topic"] == "flu", f"Expected topic to be updated to 'flu', got {final_state['topic']}"
     assert final_state["continue_session"] is False
@@ -1418,18 +1631,18 @@ def main():
     print("=" * 70)
     print("TEST 14: adaptive re-explanation on a low grade")
     print("=" * 70)
-    main_path = ["ask_topic", "search_topic", "summarize_results", "present_summary",
-                 "generate_quiz", "ask_quiz_question", "grade_answer", "present_grade"]
+    main_path = MAIN_PATH
 
     # (a) A good grade skips the branch entirely.
     run_test(single, grade="B")
-    assert visited_nodes == main_path + ["ask_continue"], visited_nodes
+    assert visited_nodes == DIRECT_PATH, visited_nodes
     assert "offer_recap" not in visited_nodes, "a passing grade must not trigger the recap"
 
     # (b) A failing grade offers help, and accepting it runs the full branch.
     run_test(["diabetes", "", "no idea", "yes", "no"], grade="F")
     assert visited_nodes == main_path + [
-        "offer_recap", "simplify_summary", "present_simple_summary", "ask_continue"
+        "offer_recap", "simplify_summary", "present_simple_summary",
+        "record_progress", "ask_continue",
     ], visited_nodes
     shown = captured_output.getvalue()
     assert "go over it in plainer language" in shown
@@ -1438,7 +1651,7 @@ def main():
 
     # (c) Declining the offer rejoins the flow without simplifying.
     final_state = run_test(["diabetes", "", "no idea", "no", "no"], grade="D")
-    assert visited_nodes == main_path + ["offer_recap", "ask_continue"], visited_nodes
+    assert visited_nodes == main_path + ["offer_recap", "record_progress", "ask_continue"], visited_nodes
     assert final_state["wants_simpler"] is False
     assert final_state["simple_summary"] is None, "nothing should have been generated"
 
@@ -1471,6 +1684,123 @@ def main():
     assert final_state["wants_simpler"] is False, final_state["wants_simpler"]
     print("PASS: low grades open the branch, good grades skip it, declining rejoins")
     print("      cleanly, the rewrite sees only the summary, and reset clears it all.\n")
+
+    print("=" * 70)
+    print("TEST 15: multiple choice as an option")
+    print("=" * 70)
+
+    # (a) Open-ended stays the default: no options, free-text answer.
+    final_state = run_test(single, quiz_format="open")
+    assert final_state["quiz_format"] == "open"
+    assert final_state["quiz_options"] is None, "open format must not carry options"
+    assert final_state["quiz_correct_index"] is None
+    assert final_state["patient_answer"] == "it affects blood sugar"
+
+    # (b) Choosing MCQ produces four numbered options and records the answer text.
+    final_state = run_test(["diabetes", "", "1", "no"], quiz_format="mcq")
+    assert final_state["quiz_format"] == "mcq"
+    assert len(final_state["quiz_options"]) == 4, final_state["quiz_options"]
+    assert final_state["quiz_correct_index"] == 0
+    # "1" selected option 1, which is stored as its text, not as the digit.
+    assert final_state["patient_answer"] == "Blood sugar", final_state["patient_answer"]
+    shown = captured_output.getvalue()
+    for n, option in enumerate(final_state["quiz_options"], start=1):
+        assert f"{n}. {option}" in shown, f"option {n} was not displayed"
+
+    # (c) Out-of-range and non-numeric picks are re-prompted, not accepted.
+    final_state = run_test(["diabetes", "", "9", "abc", "0", "2", "no"], quiz_format="mcq")
+    assert final_state["patient_answer"] == "Eyesight only", final_state["patient_answer"]
+    assert captured_output.getvalue().count("Please enter a number from 1 to 4") == 3
+
+    # (d) The grader is handed the correct option rather than re-deriving it.
+    run_test(["diabetes", "", "1", "no"], quiz_format="mcq")
+    grade_payload = FakeGenericLLM.payloads["grade"]
+    joined = " ".join(m.content for m in grade_payload if isinstance(m.content, str))
+    assert "multiple-choice question" in joined, "MCQ ground truth not passed to the grader"
+    assert "'Blood sugar'" in joined, "the correct option was not named for the grader"
+
+    # (e) The option list is generated from the summary only, never raw search results.
+    mcq_payload = FakeGenericLLM.payloads["mcq"]
+    assert not any(isinstance(m, ToolMessage) for m in mcq_payload), \
+        "MCQ generation must not receive raw search results"
+
+    # (f) The schema rejects duplicate options -- four options that repeat are not four.
+    try:
+        MultipleChoiceQuiz(question="Which one?", options=["a", "b", "a", "c"],
+                           correct_index=0, citation=FAKE_CITATION)
+    except Exception as error:
+        assert "distinct" in str(error), str(error)
+    else:
+        raise AssertionError("duplicate options should have been rejected")
+
+    # (g) A provider that cannot build a valid MCQ degrades to an open question.
+    final_state = run_test(["diabetes", "", "blood sugar", "no"],
+                           quiz_format="mcq", mcq_ok=False)
+    assert final_state["quiz_options"] is None, "should have fallen back to open-ended"
+    assert final_state["grade"] == "B", "the check should still complete"
+    assert "wasn't available" in captured_output.getvalue(), "the fallback was not announced"
+    print("PASS: open-ended remains the default, MCQ renders and validates four distinct")
+    print("      options, bad picks re-prompt, the grader gets ground truth, and an")
+    print("      unavailable schema degrades to an open question.\n")
+
+    print("=" * 70)
+    print("TEST 16: end-of-session recap keeps metadata only")
+    print("=" * 70)
+
+    # (a) One entry per completed topic, in order.
+    run_test(
+        ["diabetes", "", "it affects blood sugar", "yes",
+         "asthma", "", "breathing", "no"],
+    )
+    assert len(SESSION_LOG) == 2, SESSION_LOG
+    assert [e["topic"] for e in SESSION_LOG] == ["diabetes", "asthma"]
+    assert all(e["grade"] == "B" for e in SESSION_LOG)
+    assert all(e["sources"] == 1 for e in SESSION_LOG), "source count not recorded"
+    assert all(e["citation_verified"] is True for e in SESSION_LOG)
+
+    # (b) No clinical content is retained -- this is what keeps the privacy reset honest.
+    allowed = {"topic", "format", "grade", "citation_verified", "sources", "simplified", "at"}
+    for entry in SESSION_LOG:
+        assert set(entry) == allowed, f"unexpected keys retained: {set(entry) - allowed}"
+        blob = " ".join(str(v) for v in entry.values())
+        assert FAKE_SUMMARY.strip()[:30] not in blob, "summary text leaked into the log"
+        assert "it affects blood sugar" not in blob, "patient answer leaked into the log"
+        assert "What does diabetes affect?" not in blob, "quiz text leaked into the log"
+
+    # (c) The log never reaches a model payload.
+    for label in ("summarize", "quiz", "grade"):
+        payload = FakeGenericLLM.payloads.get(label) or []
+        joined = " ".join(m.content for m in payload if isinstance(m.content, str))
+        assert "Session summary" not in joined, f"the recap leaked into the {label} prompt"
+
+    # (d) Format and the simpler-recap flag are recorded per topic.
+    run_test(["diabetes", "", "1", "no"], quiz_format="mcq")
+    assert SESSION_LOG[0]["format"] == "multiple choice", SESSION_LOG[0]
+    run_test(["diabetes", "", "no idea", "yes", "no"], grade="F")
+    assert SESSION_LOG[0]["simplified"] is True, "a used rewrite should be recorded"
+    run_test(["diabetes", "", "no idea", "no", "no"], grade="F")
+    assert SESSION_LOG[0]["simplified"] is False, "a declined rewrite must not be recorded as used"
+
+    # (e) The rendered recap reports the tally without exposing content.
+    run_test(["diabetes", "", "it affects blood sugar", "no"])
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        render_session_recap()
+    recap = buffer.getvalue()
+    assert "Session summary" in recap
+    assert "1 topic" in recap, recap
+    assert "diabetes" in recap
+    assert FAKE_SUMMARY.strip()[:30] not in recap, "recap exposed summary text"
+    assert "discarded between topics" in recap, "the privacy note should be shown"
+
+    # (f) An empty log renders nothing rather than an empty table.
+    SESSION_LOG.clear()
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        render_session_recap()
+    assert buffer.getvalue() == "", f"expected no output, got {buffer.getvalue()!r}"
+    print("PASS: one entry per topic with metadata only, no clinical content retained,")
+    print("      the log never enters a prompt, and an empty log renders nothing.\n")
 
     print("=" * 70)
     print("ALL TESTS PASSED")
