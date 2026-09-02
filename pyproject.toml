@@ -19,6 +19,7 @@ dependencies = [
     "langfuse>=4.15.1",
     "langgraph>=1.2.11",
     "openai>=3.5.0",
+    "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
     "requests>=2.34.2",
     "tavily-python>=0.8.0",

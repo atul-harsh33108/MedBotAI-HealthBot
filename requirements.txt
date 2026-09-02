@@ -32,6 +32,11 @@ ipykernel>=7.3.0
 # --- Configuration ----------------------------------------------------------
 python-dotenv>=1.2.3
 
+# --- Structured model output (grading schema + citation verification) --------
+# A transitive dependency of langchain, but the notebook imports it directly, so
+# it is declared here rather than relied on implicitly.
+pydantic>=2.13.5
+
 # --- Used only by the API connectivity scripts (test_api_keys*.py) -----------
 requests>=2.34.2
 boto3>=1.43.83

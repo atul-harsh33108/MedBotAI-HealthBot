@@ -33,11 +33,12 @@ import io
 import re
 import sys
 import time
-from typing import Annotated, Optional, TypedDict
+from typing import Annotated, Literal, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages, RemoveMessage
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +56,10 @@ class HealthBotState(TypedDict):
     patient_answer: Optional[str]
     grade: Optional[str]
     feedback: Optional[str]
+    citation: Optional[str]
+    citation_verified: Optional[bool]
+    wants_simpler: Optional[bool]
+    simple_summary: Optional[str]
     continue_session: Optional[bool]
 
 
@@ -72,6 +77,10 @@ class HealthBotUpdate(TypedDict, total=False):
     patient_answer: Optional[str]
     grade: Optional[str]
     feedback: Optional[str]
+    citation: Optional[str]
+    citation_verified: Optional[bool]
+    wants_simpler: Optional[bool]
+    simple_summary: Optional[str]
     continue_session: Optional[bool]
 
 
@@ -132,12 +141,19 @@ TRANSIENT_MARKERS = (
     "temporarily unavailable", "502", "503", "504",
 )
 
-DAILY_QUOTA_MARKERS = ("per day", "daily limit", "insufficient_quota", "exceeded your current quota")
-
-PROVIDER_MARKERS = (
+SWITCH_MARKERS = (
+    "per day", "daily limit", "quota", "resource_exhausted", "insufficient_quota",
+    "exceeded your current quota",
+    "credit balance", "billing", "insufficient funds", "payment required", "402",
+    "spending limit", "hard limit", "purchase credits",
     "api key", "unauthorized", "401", "403", "permission denied", "authentication",
     "not found", "404", "does not exist", "does not support", "unsupported",
-    "model_not_found", "invalid model", "tool choice", "resource_exhausted", "quota",
+    "model_not_found", "invalid model", "tool choice",
+)
+
+BUG_TYPES = (
+    TypeError, AttributeError, KeyError, IndexError, NameError,
+    ImportError, AssertionError,
 )
 
 MAX_ATTEMPTS = 3
@@ -194,7 +210,7 @@ _model_cache: dict = {}
 _active_provider = 0
 
 
-def _get_model(key: str, with_tools: bool):
+def _get_model(key: str, with_tools: bool, schema=None):
     """Overridden by the graph tests and by TEST 10."""
     raise NotImplementedError
 
@@ -212,17 +228,17 @@ def _attempt(model, payload, what: str, label: str):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             return model.invoke(payload)
+        except BUG_TYPES as error:
+            raise _NonRecoverable(f"{type(error).__name__}: {error}") from error
         except Exception as error:
-            if _matches(error, DAILY_QUOTA_MARKERS) or _matches(error, PROVIDER_MARKERS):
+            if _matches(error, SWITCH_MARKERS):
                 raise
-            if not _matches(error, TRANSIENT_MARKERS):
-                raise _NonRecoverable(str(error)) from error
-            if attempt == MAX_ATTEMPTS:
+            if not _matches(error, TRANSIENT_MARKERS) or attempt == MAX_ATTEMPTS:
                 raise
             time.sleep(BACKOFF_SECONDS * attempt)
 
 
-def invoke_model(payload, what: str = "the request", with_tools: bool = False):
+def invoke_model(payload, what: str = "the request", with_tools: bool = False, schema=None):
     global _active_provider
 
     failures = []
@@ -231,7 +247,7 @@ def invoke_model(payload, what: str = "the request", with_tools: bool = False):
         label = AVAILABLE_MODELS[key]["label"]
 
         try:
-            result = _attempt(_get_model(key, with_tools), payload, what, label)
+            result = _attempt(_get_model(key, with_tools, schema), payload, what, label)
         except _NonRecoverable as error:
             raise HealthBotServiceError(
                 f"Sorry -- {what} failed for a reason that changing provider will not fix: {error}"
@@ -244,8 +260,8 @@ def invoke_model(payload, what: str = "the request", with_tools: bool = False):
         return result
 
     raise HealthBotServiceError(
-        f"Sorry -- {what} could not be completed. Every configured provider failed:\n  "
-        + "\n  ".join(failures)
+        f"Sorry -- {what} could not be completed. Every configured provider was tried "
+        f"and each one failed:\n  " + "\n  ".join(failures)
     )
 
 
@@ -275,6 +291,26 @@ def message_text(message: AnyMessage) -> str:
 GRADE_LABEL = re.compile(r"^[ \t>*_#\-]*grade\s*[:\-]\s*\**\s*", re.IGNORECASE | re.MULTILINE)
 JUSTIFICATION_LABEL = re.compile(r"^[ \t>*_#\-]*justification\s*[:\-]\s*\**\s*", re.IGNORECASE | re.MULTILINE)
 LETTER_GRADE = re.compile(r"^([A-F][+-]?)(?![A-Za-z0-9])", re.IGNORECASE)
+FIRST_QUOTE = re.compile(r'"([^"]{10,})"')
+
+
+class GradeResult(BaseModel):
+    """Structured grading result (identical to notebook)."""
+
+    grade: Literal["A", "B", "C", "D", "F"]
+    citation: str = Field(min_length=10)
+    justification: str = Field(min_length=20)
+
+
+def _normalise_quote(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower()).strip(" \"'`.,;:!?-")
+
+
+def citation_is_grounded(citation: str, summary: str) -> bool:
+    quote = _normalise_quote(citation)
+    if len(quote) < 10:
+        return False
+    return quote in _normalise_quote(summary)
 
 
 def _strip_code_fence(text: str) -> str:
@@ -343,6 +379,21 @@ DISCLAIMER = (
     "a qualified healthcare professional._"
 )
 
+AFFIRMATIVE = {"y", "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "please",
+               "another", "again", "more", "continue"}
+NEGATIVE = {"n", "no", "nope", "nah", "exit", "quit", "stop", "done", "finish",
+            "nothing", "end"}
+
+
+def ask_yes_no(question: str) -> bool:
+    while True:
+        choice = builtins.input(question).strip().lower()
+        if choice in AFFIRMATIVE:
+            return True
+        if choice in NEGATIVE:
+            return False
+        print("  Sorry, I didn't catch that -- please answer yes or no.")
+
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -379,6 +430,45 @@ class FakeTavilyTool:
 
 
 FAKE_SUMMARY = "FAKE SUMMARY: Diabetes is a chronic condition affecting blood sugar. " * 3
+
+# A quote that really is in FAKE_SUMMARY, so citation verification should pass.
+FAKE_CITATION = "Diabetes is a chronic condition affecting blood sugar"
+UNGROUNDED_CITATION = "Diabetes is cured entirely by drinking water"
+
+FAKE_JUSTIFICATION = (
+    'The answer aligns with "Diabetes is a chronic condition affecting blood sugar."\n'
+    "It could have gone further by mentioning how the body handles insulin.\n"
+    "Nice work overall -- you clearly read the summary."
+)
+
+
+class FakeStructuredLLM:
+    """Simulates a provider honouring with_structured_output(GradeResult)."""
+
+    grade = "B"
+    justification = FAKE_JUSTIFICATION
+    citations: list = []  # popped in order; a single entry repeats
+    calls = 0
+
+    def invoke(self, messages):
+        FakeStructuredLLM.calls += 1
+        # Recorded in the shared store so the payload assertions in TEST 2 apply
+        # to the structured path too.
+        FakeGenericLLM.payloads["grade"] = messages
+        pool = FakeStructuredLLM.citations or [FAKE_CITATION]
+        citation = pool[0] if len(pool) == 1 else pool.pop(0)
+        return GradeResult(
+            grade=FakeStructuredLLM.grade,
+            citation=citation,
+            justification=FakeStructuredLLM.justification,
+        )
+
+
+class FakeSchemaUnsupported:
+    """A provider that cannot honour a schema, forcing the free-text fallback."""
+
+    def invoke(self, messages):
+        raise NotImplementedError("structured output not supported by this provider")
 
 # Bolded labels and a justification spanning several lines: the shape models
 # actually produce, which the original parser could not read.
@@ -419,22 +509,31 @@ class FakeGenericLLM:
         if "grading a patient's answer" in system_prompt:
             FakeGenericLLM.payloads["grade"] = messages
             return AIMessage(content=FAKE_GRADE_RESPONSE)
+        if "more simply" in system_prompt:
+            FakeGenericLLM.payloads["simplify"] = messages
+            return AIMessage(content="SIMPLER: diabetes means blood sugar runs too high.")
         return AIMessage(content="FAKE GENERIC RESPONSE")
 
 
 class FlakyLLM:
-    """Fails with a transient error `failures` times, then succeeds."""
+    """Fails `failures` times, then succeeds.
 
-    def __init__(self, failures, message="429 RESOURCE_EXHAUSTED: quota exceeded"):
+    `error_type` lets a test raise a real Python error (TypeError and friends) so
+    the type-based bug detection can be exercised, not just message matching.
+    """
+
+    def __init__(self, failures, message="429 RESOURCE_EXHAUSTED: quota exceeded",
+                 error_type=RuntimeError):
         self.remaining = failures
         self.message = message
+        self.error_type = error_type
         self.attempts = 0
 
     def invoke(self, payload):
         self.attempts += 1
         if self.remaining > 0:
             self.remaining -= 1
-            raise RuntimeError(self.message)
+            raise self.error_type(self.message)
         return AIMessage(content="recovered")
 
 
@@ -595,42 +694,121 @@ def ask_quiz_question(state: HealthBotState) -> HealthBotUpdate:
 
 def grade_answer(state: HealthBotState) -> HealthBotUpdate:
     visited_nodes.append("grade_answer")
-    prompt = f"Patient's answer: {state['patient_answer']}"
-    response = invoke_model(
-        build_model_payload(GRADE_SYSTEM_PROMPT, state, prompt, include_search_results=False),
-        what="the grading",
-    )
-    result_text = message_text(response)
-    grade, feedback = parse_grade_response(result_text)
+    summary = state["summary"]
+    prompt = f"Summary:\n{summary}\n\nPatient's answer: {state['patient_answer']}"
 
-    return {"grade": grade, "feedback": feedback, "messages": [AIMessage(content=result_text)]}
+    def structured(extra: str = ""):
+        return invoke_model(
+            build_model_payload(
+                GRADE_SYSTEM_PROMPT, state, prompt + extra, include_search_results=False
+            ),
+            what="the grading",
+            schema=GradeResult,
+        )
+
+    try:
+        result = structured()
+        verified = citation_is_grounded(result.citation, summary)
+        if not verified:
+            result = structured(
+                "\n\nYour previous attempt quoted text that does not appear in the "
+                f"summary: {result.citation!r}. Copy a citation verbatim."
+            )
+            verified = citation_is_grounded(result.citation, summary)
+        grade, citation, feedback = result.grade, result.citation, result.justification
+        transcript = f"Grade: {grade}\nJustification: {feedback}"
+    except Exception:
+        response = invoke_model(
+            build_model_payload(GRADE_SYSTEM_PROMPT, state, prompt, include_search_results=False),
+            what="the grading",
+        )
+        transcript = message_text(response)
+        grade, feedback = parse_grade_response(transcript)
+        quoted = FIRST_QUOTE.search(feedback)
+        citation = quoted.group(1) if quoted else ""
+        verified = citation_is_grounded(citation, summary) if citation else None
+
+    return {
+        "grade": grade or "N/A",
+        "feedback": feedback,
+        "citation": citation,
+        "citation_verified": verified,
+        "messages": [AIMessage(content=transcript)],
+    }
+
+
+CITATION_BADGE = {
+    True: "Citation checked against the summary.",
+    False: "Citation could NOT be matched to the summary, so treat it with caution.",
+    None: "Citation not verified.",
+}
 
 
 def present_grade(state: HealthBotState) -> HealthBotUpdate:
     visited_nodes.append("present_grade")
+    parts = [
+        "### Your results",
+        "",
+        f"**Grade:** {state['grade']}",
+        "",
+        state["feedback"] or "",
+    ]
+    citation = (state.get("citation") or "").strip()
+    if citation:
+        parts += [
+            "",
+            "> " + " ".join(citation.split()),
+            "",
+            f"_{CITATION_BADGE[state.get('citation_verified')]}_",
+        ]
+    render_markdown("\n".join(parts))
+    return {}
+
+
+LOW_GRADES = {"D", "F"}
+
+
+def route_after_grade(state: HealthBotState) -> str:
+    grade = (state.get("grade") or "").strip().upper()
+    return "offer_recap" if grade[:1] in LOW_GRADES else "ask_continue"
+
+
+def offer_recap(state: HealthBotState) -> HealthBotUpdate:
+    visited_nodes.append("offer_recap")
+    render_markdown("That one didn't quite land. I can go over it in plainer language.")
+    return {"wants_simpler": ask_yes_no("Simpler explanation? (yes/no): ")}
+
+
+def route_recap(state: HealthBotState) -> str:
+    return "simplify_summary" if state.get("wants_simpler") else "ask_continue"
+
+
+SIMPLIFY_SYSTEM_PROMPT = "explain the same material again more simply"
+
+
+def simplify_summary(state: HealthBotState) -> HealthBotUpdate:
+    visited_nodes.append("simplify_summary")
+    prompt = f"Original summary:\n{state['summary']}"
+    response = invoke_model(
+        build_model_payload(SIMPLIFY_SYSTEM_PROMPT, state, prompt, include_search_results=False),
+        what="the simpler explanation",
+    )
+    simple = message_text(response)
+    return {"simple_summary": simple, "messages": [AIMessage(content=simple)]}
+
+
+def present_simple_summary(state: HealthBotState) -> HealthBotUpdate:
+    visited_nodes.append("present_simple_summary")
     render_markdown(
-        "### Your results\n\n"
-        f"**Grade:** {state['grade']}\n\n"
-        f"**Feedback:** {state['feedback']}"
+        "### Let's go over that again, more simply\n\n"
+        f"{state['simple_summary']}\n\n{DISCLAIMER}\n\n---"
     )
     return {}
 
 
-AFFIRMATIVE = {"y", "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "please",
-               "another", "again", "more", "continue"}
-NEGATIVE = {"n", "no", "nope", "nah", "exit", "quit", "stop", "done", "finish",
-            "nothing", "end"}
-
-
 def ask_continue(state: HealthBotState) -> HealthBotUpdate:
     visited_nodes.append("ask_continue")
-    while True:
-        choice = builtins.input("Another topic? (yes/no): ").strip().lower()
-        if choice in AFFIRMATIVE:
-            return {"continue_session": True}
-        if choice in NEGATIVE:
-            return {"continue_session": False}
-        print("  Sorry, I didn't catch that -- please answer yes or no.")
+    return {"continue_session": ask_yes_no("Another topic? (yes/no): ")}
 
 
 def route_continue(state: HealthBotState) -> str:
@@ -653,6 +831,10 @@ def reset_state(state: HealthBotState) -> HealthBotUpdate:
         "patient_answer": None,
         "grade": None,
         "feedback": None,
+        "citation": None,
+        "citation_verified": None,
+        "wants_simpler": None,
+        "simple_summary": None,
         "continue_session": None,
     }
 
@@ -670,6 +852,9 @@ def build_graph():
     gb.add_node("ask_quiz_question", ask_quiz_question)
     gb.add_node("grade_answer", grade_answer)
     gb.add_node("present_grade", present_grade)
+    gb.add_node("offer_recap", offer_recap)
+    gb.add_node("simplify_summary", simplify_summary)
+    gb.add_node("present_simple_summary", present_simple_summary)
     gb.add_node("ask_continue", ask_continue)
     gb.add_node("reset_state", reset_state)
 
@@ -681,7 +866,12 @@ def build_graph():
     gb.add_edge("generate_quiz", "ask_quiz_question")
     gb.add_edge("ask_quiz_question", "grade_answer")
     gb.add_edge("grade_answer", "present_grade")
-    gb.add_edge("present_grade", "ask_continue")
+    gb.add_conditional_edges("present_grade", route_after_grade,
+                             {"offer_recap": "offer_recap", "ask_continue": "ask_continue"})
+    gb.add_conditional_edges("offer_recap", route_recap,
+                             {"simplify_summary": "simplify_summary", "ask_continue": "ask_continue"})
+    gb.add_edge("simplify_summary", "present_simple_summary")
+    gb.add_edge("present_simple_summary", "ask_continue")
     gb.add_conditional_edges("ask_continue", route_continue, {"reset_state": "reset_state", END: END})
     gb.add_edge("reset_state", "ask_topic")
 
@@ -691,14 +881,26 @@ def build_graph():
 captured_output = io.StringIO()
 
 
-def run_test(scripted_inputs, use_fallback=False):
+def run_test(scripted_inputs, use_fallback=False, structured=True,
+             grade="B", citations=None):
     global llm_with_tavily, captured_output, _get_model, _active_provider, FAILOVER_ORDER
     llm_with_tavily = FakeNoToolCallLLM() if use_fallback else FakeToolCallLLM()
+
+    FakeStructuredLLM.grade = grade
+    FakeStructuredLLM.citations = list(citations) if citations else [FAKE_CITATION]
+    FakeStructuredLLM.calls = 0
+    grader = FakeStructuredLLM() if structured else FakeSchemaUnsupported()
 
     # Single fake provider for the graph tests; failover itself is TEST 10.
     FAILOVER_ORDER = ["1"]
     _active_provider = 0
-    _get_model = lambda key, with_tools: llm_with_tavily if with_tools else llm
+
+    def fake_get_model(key, with_tools, schema=None):
+        if with_tools:
+            return llm_with_tavily
+        return grader if schema is not None else llm
+
+    _get_model = fake_get_model
 
     visited_nodes.clear()
     FakeTavilyTool.call_log.clear()
@@ -719,7 +921,9 @@ def run_test(scripted_inputs, use_fallback=False):
             "search_used_tool_call": None, "search_sources": None,
             "search_results": None, "summary": None,
             "quiz_question": None, "patient_answer": None, "grade": None,
-            "feedback": None, "continue_session": None,
+            "feedback": None, "citation": None, "citation_verified": None,
+            "wants_simpler": None, "simple_summary": None,
+            "continue_session": None,
         }
         # Node output is captured rather than printed, so the test log stays
         # readable -- and so test 7 can assert on what the patient would see.
@@ -988,7 +1192,7 @@ def main():
         global FAILOVER_ORDER, _get_model, _active_provider
         FAILOVER_ORDER = [preferred] + [k for k in AVAILABLE_MODELS if k != preferred]
         _active_provider = 0
-        _get_model = lambda key, with_tools: providers[key]
+        _get_model = lambda key, with_tools, schema=None: providers[key]
 
     # (a) Daily quota on the preferred provider: switch without burning retries.
     providers = {
@@ -1041,8 +1245,10 @@ def main():
     else:
         raise AssertionError("expected HealthBotServiceError when every provider fails")
 
-    # (f) An error that looks like our bug is raised at once, not tried four times.
-    providers = {k: FlakyLLM(failures=99, message="TypeError: unhashable type: 'dict'") for k in "1234"}
+    # (f) A real code bug stops after one attempt. Detection is by exception TYPE,
+    # not message text -- a provider message we have never seen must still cascade.
+    providers = {k: FlakyLLM(failures=99, error_type=TypeError,
+                             message="unhashable type: 'dict'") for k in "1234"}
     wire(providers)
     try:
         invoke_model([], what="the summary")
@@ -1052,6 +1258,29 @@ def main():
         assert sum(providers[k].attempts for k in "134") == 0, "should not have tried other providers"
     else:
         raise AssertionError("expected HealthBotServiceError for a non-recoverable error")
+
+    # (g) Billing exhaustion switches provider. This is the case that ended a real
+    # session: none of the old marker sets matched "credit balance is too low", so
+    # it was misread as a code bug and the remaining provider was never tried.
+    billing = (
+        "Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+        "'message': 'Your credit balance is too low to access the Anthropic API. Please "
+        "go to Plans & Billing to upgrade or purchase credits.'}}"
+    )
+    providers = {"1": FlakyLLM(failures=0), "2": FlakyLLM(failures=99, message=billing),
+                 "3": FlakyLLM(failures=0), "4": FlakyLLM(failures=0)}
+    wire(providers)
+    assert invoke_model([], what="the medical search", with_tools=True).content == "recovered"
+    assert providers["2"].attempts == 1, "billing errors must not be retried"
+    assert providers["1"].attempts == 1, "should have switched to the next provider"
+
+    # (h) An unrecognised provider message cascades rather than ending the session.
+    providers = {"1": FlakyLLM(failures=0),
+                 "2": FlakyLLM(failures=99, message="Error code: 418 - never seen before"),
+                 "3": FlakyLLM(failures=0), "4": FlakyLLM(failures=0)}
+    wire(providers)
+    assert invoke_model([], what="the summary").content == "recovered"
+    assert providers["1"].attempts == 1, "unknown errors should fall through to the next provider"
 
     print("PASS: daily caps and provider errors switch without waiting, transient limits")
     print("      retry in place, the switch sticks, and our own bugs surface immediately.\n")
@@ -1139,6 +1368,109 @@ def main():
     reset_provider_failover()
     assert _active_provider == 0, "a new topic should retry the preferred provider"
     print("PASS: reset_provider_failover returns to the preferred provider.\n")
+
+    print("=" * 70)
+    print("TEST 13: structured grading with citation verification")
+    print("=" * 70)
+    single = ["diabetes", "", "it affects blood sugar", "no"]
+
+    # (a) A grounded citation verifies on the first attempt.
+    final_state = run_test(single)
+    assert final_state["grade"] == "B"
+    assert final_state["citation"] == FAKE_CITATION
+    assert final_state["citation_verified"] is True, "a real quote should verify"
+    assert FakeStructuredLLM.calls == 1, f"expected 1 structured call, got {FakeStructuredLLM.calls}"
+    assert "Citation checked against the summary" in captured_output.getvalue()
+
+    # (b) A fabricated quote earns one corrective retry, then verifies.
+    final_state = run_test(single, citations=[UNGROUNDED_CITATION, FAKE_CITATION])
+    assert FakeStructuredLLM.calls == 2, f"expected a retry, got {FakeStructuredLLM.calls} call(s)"
+    assert final_state["citation_verified"] is True
+    assert final_state["citation"] == FAKE_CITATION
+
+    # (c) If it stays fabricated, the grade still lands but is flagged, not trusted.
+    final_state = run_test(single, citations=[UNGROUNDED_CITATION, UNGROUNDED_CITATION])
+    assert final_state["citation_verified"] is False, "unmatched quote must be flagged"
+    assert final_state["grade"] == "B", "a bad citation should not lose the grade"
+    assert "could NOT be matched" in captured_output.getvalue()
+
+    # (d) The letter grade is schema-constrained, so "N/A" is unreachable here.
+    for letter in ("A", "B", "C", "D", "F"):
+        state = run_test(["x", "", "y", "yes" if letter in ("D", "F") else "no",
+                          *(["no"] if letter in ("D", "F") else [])],
+                         grade=letter)
+        assert state["grade"] == letter, f"expected {letter}, got {state['grade']}"
+
+    # (e) A provider that cannot honour the schema falls back to free text.
+    final_state = run_test(single, structured=False)
+    assert final_state["grade"] == "B", f"fallback lost the grade: {final_state['grade']}"
+    assert final_state["feedback"].startswith("The answer aligns with"), "fallback parse failed"
+    assert final_state["citation_verified"] is True, "fallback should still verify its quote"
+
+    # (f) The verifier itself: substring match, whitespace/case tolerant, no false yes.
+    assert citation_is_grounded("CHRONIC   condition affecting BLOOD sugar", FAKE_SUMMARY)
+    assert not citation_is_grounded(UNGROUNDED_CITATION, FAKE_SUMMARY)
+    assert not citation_is_grounded("", FAKE_SUMMARY)
+    assert not citation_is_grounded("short", FAKE_SUMMARY), "too-short quotes must not pass"
+    print("PASS: grounded citations verify, fabricated ones are retried then flagged,")
+    print("      grades stay schema-constrained, and the free-text fallback still works.\n")
+
+    print("=" * 70)
+    print("TEST 14: adaptive re-explanation on a low grade")
+    print("=" * 70)
+    main_path = ["ask_topic", "search_topic", "summarize_results", "present_summary",
+                 "generate_quiz", "ask_quiz_question", "grade_answer", "present_grade"]
+
+    # (a) A good grade skips the branch entirely.
+    run_test(single, grade="B")
+    assert visited_nodes == main_path + ["ask_continue"], visited_nodes
+    assert "offer_recap" not in visited_nodes, "a passing grade must not trigger the recap"
+
+    # (b) A failing grade offers help, and accepting it runs the full branch.
+    run_test(["diabetes", "", "no idea", "yes", "no"], grade="F")
+    assert visited_nodes == main_path + [
+        "offer_recap", "simplify_summary", "present_simple_summary", "ask_continue"
+    ], visited_nodes
+    shown = captured_output.getvalue()
+    assert "go over it in plainer language" in shown
+    assert "more simply" in shown, "the simpler explanation was not displayed"
+    assert "not medical advice" in shown, "the disclaimer must appear on the recap too"
+
+    # (c) Declining the offer rejoins the flow without simplifying.
+    final_state = run_test(["diabetes", "", "no idea", "no", "no"], grade="D")
+    assert visited_nodes == main_path + ["offer_recap", "ask_continue"], visited_nodes
+    assert final_state["wants_simpler"] is False
+    assert final_state["simple_summary"] is None, "nothing should have been generated"
+
+    # (d) The rewrite is bound to the summary only -- no raw search results.
+    run_test(["diabetes", "", "no idea", "yes", "no"], grade="F")
+    simplify_payload = FakeGenericLLM.payloads["simplify"]
+    assert not any(isinstance(m, ToolMessage) for m in simplify_payload), \
+        "the simpler explanation must not receive raw search results"
+    assert any(FAKE_SUMMARY.strip()[:40] in m.content
+               for m in simplify_payload if isinstance(m.content, str)), \
+        "the simpler explanation should be given the original summary"
+
+    # (e) Restarting after the branch still clears the new fields. Topic 2 also
+    # scores F, so it is offered the recap as well -- declined here.
+    final_state = run_test(
+        ["diabetes", "", "no idea", "yes",        # topic 1: accept the recap
+         "yes",                                    # ...then start another topic
+         "asthma", "", "breathing", "no",         # topic 2: decline the recap
+         "no"],                                    # ...and exit
+        grade="F",
+    )
+    assert visited_nodes.count("reset_state") == 1
+    assert visited_nodes.count("offer_recap") == 2, visited_nodes
+    assert visited_nodes.count("simplify_summary") == 1, "topic 2 declined, so no rewrite"
+    assert final_state["topic"] == "asthma"
+    # Topic 1 generated a rewrite; topic 2 declined. simple_summary being empty
+    # proves the reset cleared topic 1's, rather than it carrying over.
+    assert final_state["simple_summary"] is None, "topic 1's rewrite survived the reset"
+    # wants_simpler is topic 2's own answer, recorded after the reset.
+    assert final_state["wants_simpler"] is False, final_state["wants_simpler"]
+    print("PASS: low grades open the branch, good grades skip it, declining rejoins")
+    print("      cleanly, the rewrite sees only the summary, and reset clears it all.\n")
 
     print("=" * 70)
     print("ALL TESTS PASSED")
