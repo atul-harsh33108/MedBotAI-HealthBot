@@ -83,6 +83,8 @@ Sign up for a free Tavily account, which will allow you to search the web and ge
 
 After signing up, you can get your API key here: **https://app.tavily.com/home(opens in a new tab)**
 
+''' Extremly Important - OpenAI is mentioned bellow but you are allowed to use any LLM api key for this project one is not working As it was mentioned by the instructor '''
+
 Create a file named config.env in the same directory as the project notebook, and a entries for both OPENAI_API_KEY and TAVILY_API_KEY
 
 e.g.
@@ -134,8 +136,8 @@ Use this project rubric to understand and assess the project criteria.
 
 **Model and Tools LangGraph Configuration**
 
-| Criteria | Submission Requirements |
-| :--- | :--- |
+| Criteria                                                                                                     | Submission Requirements                                                                                                                                      |
+| :-------------------------------------------------------------------------------------------------------------| :-------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | The student has properly configured OpenAI and Tavily so that the model is capable of calling Tavily search. | 1. API keys are loaded correctly.<br>2. Successful API calls are made to both Tavily and OpenAI services.<br>3. OpenAI successfully calls Tavily for search. |
 
 **Model Summarization of Search Results**

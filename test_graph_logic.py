@@ -46,6 +46,8 @@ from langgraph.graph.message import add_messages, RemoveMessage
 class HealthBotState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     topic: Optional[str]
+    search_queries: Optional[list[str]]
+    search_used_tool_call: Optional[bool]
     search_results: Optional[str]
     summary: Optional[str]
     quiz_question: Optional[str]
@@ -163,6 +165,10 @@ _active_provider = 0
 def _get_model(key: str, with_tools: bool):
     """Overridden by the graph tests and by TEST 10."""
     raise NotImplementedError
+
+
+def active_model_label() -> str:
+    return AVAILABLE_MODELS[FAILOVER_ORDER[_active_provider]]["label"]
 
 
 def _attempt(model, payload, what: str, label: str):
@@ -411,6 +417,22 @@ def ask_topic(state: HealthBotState) -> HealthBotState:
     return {"topic": topic, "messages": [HumanMessage(content=f"I would like to learn about: {topic}")]}
 
 
+def describe_search(ai_message, queries: list[str], used_tool_call: bool) -> str:
+    shown = ", ".join(f"`{query}`" for query in queries)
+    plural = "query" if len(queries) == 1 else "queries"
+
+    if used_tool_call:
+        tools = ", ".join(sorted({call["name"] for call in ai_message.tool_calls}))
+        return (
+            f"**{active_model_label()}** issued a tool call to `{tools}` "
+            f"with {len(queries)} {plural}: {shown}"
+        )
+    return (
+        f"**{active_model_label()}** returned no tool call, so HealthBot searched "
+        f"Tavily directly for {shown}."
+    )
+
+
 def search_topic(state: HealthBotState) -> HealthBotState:
     visited_nodes.append("search_topic")
     topic = state["topic"]
@@ -420,18 +442,30 @@ def search_topic(state: HealthBotState) -> HealthBotState:
         with_tools=True,
     )
 
+    used_tool_call = bool(ai_message.tool_calls)
+    queries: list[str] = []
     tool_messages = []
-    if ai_message.tool_calls:
+
+    if used_tool_call:
         for call in ai_message.tool_calls:
             query = call["args"].get("query", topic)
+            queries.append(query)
             results = invoke_tool(tavily_tool, query)
             tool_messages.append(ToolMessage(content=str(results), tool_call_id=call["id"]))
     else:
+        queries.append(topic)
         results = invoke_tool(tavily_tool, topic)
         tool_messages.append(ToolMessage(content=str(results), tool_call_id="fallback"))
 
+    render_markdown(describe_search(ai_message, queries, used_tool_call))
+
     search_results_text = "\n\n".join(tm.content for tm in tool_messages)
-    return {"search_results": search_results_text, "messages": [ai_message, *tool_messages]}
+    return {
+        "search_results": search_results_text,
+        "search_queries": queries,
+        "search_used_tool_call": used_tool_call,
+        "messages": [ai_message, *tool_messages],
+    }
 
 
 def summarize_results(state: HealthBotState) -> HealthBotState:
@@ -513,6 +547,8 @@ def reset_state(state: HealthBotState) -> HealthBotState:
     return {
         "messages": [RemoveMessage(id=m.id) for m in state["messages"]],
         "topic": None,
+        "search_queries": None,
+        "search_used_tool_call": None,
         "search_results": None,
         "summary": None,
         "quiz_question": None,
@@ -581,7 +617,8 @@ def run_test(scripted_inputs, use_fallback=False):
     try:
         graph = build_graph()
         initial_state: HealthBotState = {
-            "messages": [], "topic": None, "search_results": None, "summary": None,
+            "messages": [], "topic": None, "search_queries": None,
+            "search_used_tool_call": None, "search_results": None, "summary": None,
             "quiz_question": None, "patient_answer": None, "grade": None,
             "feedback": None, "continue_session": None,
         }
@@ -610,7 +647,15 @@ def main():
     assert final_state["grade"] == "B", f"Expected grade B, got {final_state['grade']}"
     assert "Diabetes is a chronic condition" in final_state["feedback"]
     assert FakeTavilyTool.call_log == ["diabetes"], f"Expected forced tool-call search, got {FakeTavilyTool.call_log}"
-    print("PASS: single-topic path, tool-call search, grading, and exit all correct.\n")
+
+    # Provenance: the model issued the tool call, and that fact is in state and shown.
+    assert final_state["search_used_tool_call"] is True, "tool-call path should be recorded"
+    assert final_state["search_queries"] == ["diabetes"], final_state["search_queries"]
+    shown = captured_output.getvalue()
+    assert "issued a tool call" in shown, "tool-call provenance was not displayed"
+    assert "tavily_search_results_json" in shown, "tool name missing from provenance line"
+    print("PASS: single-topic path, tool-call search, grading, and exit all correct;")
+    print("      search provenance recorded in state and shown to the reader.\n")
 
     print("=" * 70)
     print("TEST 2: Message history is replayed into the model")
@@ -697,7 +742,14 @@ def main():
         use_fallback=True,
     )
     assert FakeTavilyTool.call_log == ["migraine"], f"Expected fallback direct search on topic, got {FakeTavilyTool.call_log}"
-    print("PASS: fallback path correctly invokes Tavily directly with the topic when no tool call is returned.\n")
+
+    # The fallback must say so, rather than claiming the model made the call.
+    assert final_state["search_used_tool_call"] is False, "fallback path should be recorded"
+    fallback_shown = captured_output.getvalue()
+    assert "returned no tool call" in fallback_shown, "fallback provenance was not displayed"
+    assert "issued a tool call" not in fallback_shown, "fallback must not claim a model tool call"
+    print("PASS: fallback path invokes Tavily directly and reports itself honestly")
+    print("      rather than claiming the model made the call.\n")
 
     print("=" * 70)
     print("TEST 6: invoke_tool retries transient search failures")
