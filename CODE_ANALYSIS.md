@@ -564,6 +564,73 @@ trailing parenthetical — plus an ungradeable response that correctly reports `
 
 ---
 
+## 13. Beyond-the-rubric improvements — RESOLVED
+
+Applied as one batch so the notebook only needed re-running once. Covered by tests 11
+and 12.
+
+### Correctness
+
+**Library warnings reached the patient.** `warnings.filterwarnings` covered only
+`DeprecationWarning`, so a `UserWarning` about `temperature` being discarded appeared
+between every section — 8 stderr blocks in one run. Fixed at the cause: some Gemini models
+use fixed sampling defaults, and `ignores_sampling_settings()` reads
+langchain-google-genai's own list of them (rather than keeping a copy that would go stale)
+so `temperature` is simply not sent where it has no effect. `select_model()` states the
+tradeoff once at setup instead. A separate `logging.Filter` drops google-genai's
+automatic-function-calling advisory, which is `logging` rather than `warnings` and so was
+never catchable by a warnings filter. Both filters match on message text, so unrelated
+warnings still surface.
+
+**`GraphRecursionError` escaped the handler.** `recursion_limit=100` capped a session at
+roughly 10 topics, and the resulting error subclasses `RecursionError` — not
+`HealthBotServiceError` — so it bypassed the run cell's `except` and produced a raw
+traceback. The limit is now derived (`NODES_PER_TOPIC * (MAX_TOPICS + 1)`) and both
+`GraphRecursionError` and `KeyboardInterrupt` are handled with a readable message.
+
+**Empty and unrecognised input was accepted.** A bare Enter at the topic prompt searched
+for `""`. `ask_continue` used `choice.startswith("y")`, so "sure", "ok" and a bare Enter
+all silently ended the session. All three prompts now re-ask, and yes/no is matched
+against explicit vocabularies.
+
+**Node annotations were wrong.** All ten nodes declared `-> HealthBotState`, but they
+return *partial* updates; `HealthBotState` is total, so a type checker rejects
+`{"topic": ...}` for missing the other keys. A `HealthBotUpdate` TypedDict with
+`total=False` sits directly beneath the state class and is now used by every node.
+
+### Safety
+
+**Prompt injection via search results.** Tavily returns untrusted web text that went
+straight into the summarize prompt — a live risk in a health context. The results are now
+fenced in an explicit `<search_results>` block, and the system prompt states that anything
+inside reading like an instruction is quoted text to disregard, never obey.
+
+**No disclaimer reached the patient.** The prompts forbid personalised advice, but nothing
+on screen said so. `present_summary` now shows one with every summary.
+
+**Provider errors were echoed verbatim into committed output.** Notebook outputs are
+committed, and provider errors sometimes echo request details. `redact()` masks anything
+key-shaped (OpenAI, Anthropic, Google, Tavily, AWS, bearer tokens) before it can reach a
+saved transcript. Ordinary error text passes through unchanged.
+
+### Quality
+
+**`str(results)` discarded structure.** The Tavily result list was stringified into a
+Python repr — noisy, token-hungry, and it buried the URLs. `format_search_results()`
+returns readable titled sections plus a source list, and tolerates malformed output.
+
+**Sources are now shown.** The URLs Tavily returned are displayed under each summary,
+deduplicated with order preserved. This lets patients verify the material and makes the
+"reputable sources" intent visible.
+
+**Failover stickiness never reset.** Once switched, the session stayed switched forever.
+`reset_provider_failover()` is called from `reset_state`, so each new topic gets a fresh
+attempt at the preferred provider — any short-lived limit has long since cleared.
+
+**Redundant import.** Cell 31 re-imported `display`, already imported in section 2.
+
+---
+
 ## 12. Output formatting — RESOLVED
 
 ### The problem
