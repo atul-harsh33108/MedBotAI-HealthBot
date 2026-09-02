@@ -248,30 +248,58 @@ def _attempt(model, payload, what: str, label: str):
             time.sleep(BACKOFF_SECONDS * attempt)
 
 
-def invoke_model(payload, what: str = "the request", with_tools: bool = False, schema=None):
+RETRY_HINT = re.compile(r"retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+MAX_HINTED_WAIT_SECONDS = 90
+
+
+def _retry_hint_seconds(errors: list[Exception]) -> Optional[float]:
+    hints = []
+    for error in errors:
+        match = RETRY_HINT.search(str(error))
+        if match:
+            hints.append(float(match.group(1)))
+    usable = [hint for hint in hints if 0 < hint <= MAX_HINTED_WAIT_SECONDS]
+    return min(usable) if usable else None
+
+
+def invoke_model(payload, what: str = "the request", with_tools: bool = False,
+                 schema=None, _already_waited: bool = False):
     global _active_provider
 
-    failures = []
-    for index in range(_active_provider, len(FAILOVER_ORDER)):
-        key = FAILOVER_ORDER[index]
+    # Start at the last known-good provider, but wrap around so no key is ever
+    # permanently excluded from a later call.
+    order = FAILOVER_ORDER[_active_provider:] + FAILOVER_ORDER[:_active_provider]
+
+    failures: list[str] = []
+    raw_errors: list[Exception] = []
+
+    for key in order:
         label = AVAILABLE_MODELS[key]["label"]
 
         try:
             result = _attempt(_get_model(key, with_tools, schema), payload, what, label)
         except _NonRecoverable as error:
             raise HealthBotServiceError(
-                f"Sorry -- {what} failed for a reason that changing provider will not fix: {error}"
+                f"Sorry -- {what} failed for a reason that changing provider will not fix: "
+                f"{redact(error)}"
             ) from error.__cause__
         except Exception as error:
-            failures.append(f"{label} -> {type(error).__name__}: {error}")
+            raw_errors.append(error)
+            failures.append(f"{label} -> {type(error).__name__}: {redact(error)}")
             continue
 
-        _active_provider = index
+        _active_provider = FAILOVER_ORDER.index(key)
         return result
 
+    wait = _retry_hint_seconds(raw_errors)
+    if wait is not None and not _already_waited:
+        time.sleep(wait + 2)
+        return invoke_model(payload, what=what, with_tools=with_tools, schema=schema,
+                            _already_waited=True)
+
     raise HealthBotServiceError(
-        f"Sorry -- {what} could not be completed. Every configured provider was tried "
-        f"and each one failed:\n  " + "\n  ".join(failures)
+        f"Sorry -- {what} could not be completed. All {len(order)} configured "
+        f"provider(s) were tried:\n  " + "\n  ".join(failures)
     )
 
 
@@ -1400,11 +1428,15 @@ def main():
         "4": {"label": "OpenRouter", "provider": "openrouter", "model": "m"},
     }
 
-    def wire(providers, preferred="2"):
-        """Point model lookup at fakes, preferring Gemini as the reported run did."""
+    def wire(providers, preferred="2", active=0):
+        """Point model lookup at fakes, preferring Gemini as the reported run did.
+
+        `active` simulates a session that has already failed over, so the
+        wrap-around behaviour can be exercised.
+        """
         global FAILOVER_ORDER, _get_model, _active_provider
         FAILOVER_ORDER = [preferred] + [k for k in AVAILABLE_MODELS if k != preferred]
-        _active_provider = 0
+        _active_provider = active
         _get_model = lambda key, with_tools, schema=None: providers[key]
 
     # (a) Daily quota on the preferred provider: switch without burning retries.
@@ -1494,6 +1526,63 @@ def main():
     wire(providers)
     assert invoke_model([], what="the summary").content == "recovered"
     assert providers["1"].attempts == 1, "unknown errors should fall through to the next provider"
+
+    # (i) A provider *behind* the active pointer must still be tried. This ended a
+    # real session: the chain had advanced past OpenRouter, OpenRouter was then
+    # never revisited, and the error still claimed every provider had been tried.
+    gemini_rpd = (
+        "429 RESOURCE_EXHAUSTED. Quota exceeded for metric: "
+        "generate_content_free_tier_requests, limit: 500. Please retry in 55.95s."
+    )
+    providers = {"1": FlakyLLM(failures=99, message=gemini_rpd), "2": FlakyLLM(failures=0),
+                 "3": FlakyLLM(failures=99, message=gemini_rpd),
+                 "4": FlakyLLM(failures=99, message=gemini_rpd)}
+    # FAILOVER_ORDER becomes ["1","2","3","4"]; active=3 means the session had
+    # already advanced to the last provider, leaving "2" behind the pointer.
+    wire(providers, preferred="1", active=3)
+    assert invoke_model([], what="the grading").content == "recovered"
+    assert providers["2"].attempts == 1, "a provider behind the pointer was skipped"
+
+    # (j) When everything is rate-limited and the API says how long, wait once.
+    providers = {k: FlakyLLM(failures=1, message=gemini_rpd) for k in "1234"}
+    wire(providers)
+    slept: list[float] = []
+    real_sleep = time.sleep
+    time.sleep = lambda seconds: slept.append(seconds)
+    try:
+        assert invoke_model([], what="the grading").content == "recovered"
+    finally:
+        time.sleep = real_sleep
+    assert slept and 55 < slept[-1] < 60, f"expected a ~56s wait, got {slept}"
+
+    # (k) That wait happens at most once, and a long hint is ignored entirely.
+    providers = {k: FlakyLLM(failures=99, message=gemini_rpd) for k in "1234"}
+    wire(providers)
+    slept.clear()
+    time.sleep = lambda seconds: slept.append(seconds)
+    try:
+        invoke_model([], what="the grading")
+    except HealthBotServiceError as error:
+        assert len(slept) == 1, f"expected exactly one wait, got {slept}"
+        assert "All 4 configured provider(s) were tried" in str(error), str(error)
+    else:
+        raise AssertionError("expected HealthBotServiceError")
+    finally:
+        time.sleep = real_sleep
+
+    providers = {k: FlakyLLM(failures=99, message="429 quota. Please retry in 3600s.")
+                 for k in "1234"}
+    wire(providers)
+    slept.clear()
+    time.sleep = lambda seconds: slept.append(seconds)
+    try:
+        invoke_model([], what="the grading")
+    except HealthBotServiceError:
+        assert not slept, f"a 3600s hint exceeds the cap and must not be waited on: {slept}"
+    else:
+        raise AssertionError("expected HealthBotServiceError")
+    finally:
+        time.sleep = real_sleep
 
     print("PASS: daily caps and provider errors switch without waiting, transient limits")
     print("      retry in place, the switch sticks, and our own bugs surface immediately.\n")
