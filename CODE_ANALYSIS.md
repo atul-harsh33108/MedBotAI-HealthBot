@@ -691,7 +691,8 @@ message also cascades, and a real `TypeError` still stops after one attempt.
 
 ## 14. Agentic enhancements — ADDED
 
-Four additions made after the rubric was already satisfied. None alters the graded path:
+Work done after the rubric was already satisfied. Three additions were kept and one was
+reverted. None of them alters the graded path:
 the required flow behaves exactly as before, and each of these is either a branch the
 reviewer can see or a stronger implementation of an existing step.
 
@@ -725,23 +726,19 @@ the verified citation so it leads with the point actually missed. Declining rejo
 flow. This is the addition that makes the graph itself more sophisticated — a second
 conditional edge, visible in the rendered diagram.
 
-**Multiple choice as an option.** A `choose_quiz_format` node asks how the patient would
-like to be tested; pressing Enter keeps open-ended, which stays the default because it is
-the format that produces a citation-backed justification. Choosing multiple choice
-generates a `MultipleChoiceQuiz` through the same structured-output mechanism as grading:
+**Multiple choice — built, then removed.** A `choose_quiz_format` node and a
+`MultipleChoiceQuiz` schema were added, then taken back out after re-reading the brief.
+Two lines decide it:
 
-```python
-class MultipleChoiceQuiz(BaseModel):
-    question: str = Field(min_length=10)
-    options: list[str] = Field(min_length=4, max_length=4)
-    correct_index: int = Field(ge=0, le=3)
-    citation: str = Field(min_length=10)
-```
+> 8. Allow the patient to **enter their answer** to the quiz question.
+> The model should provide a grade (A, B, C, etc) as well as **justification** why it gave
+> the grade that it did.
 
-A `field_validator` rejects duplicate options, the citation is verified against the summary
-exactly as in grading, and the correct option is handed to the grader as ground truth
-rather than being re-derived. If a provider cannot produce a valid four-option question the
-node degrades to an open question instead of failing the comprehension check.
+"Enter their answer" describes typing, not selecting, and a citation-backed justification
+is largely redundant when the answer is one of four options. The brief does not forbid
+multiple choice, but everything it says about the comprehension check assumes free text,
+and a submission graded against those words gains nothing from the alternative while
+risking a deviation. The comprehension check is open-ended only.
 
 **End-of-session recap.** This needed care, because the rubric requires state reset
 *specifically* so one topic's health information cannot reach the next — a history holding
