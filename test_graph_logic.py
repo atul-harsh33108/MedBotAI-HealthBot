@@ -23,7 +23,9 @@ scripted queue of patient responses. It verifies:
  12. Provider failover: a daily cap or provider error switches to the next
      configured key, transient limits retry in place, and the switch sticks.
  13. The end-of-session recap retains metadata only and never enters a prompt.
- 14. The notebook defines every function it calls -- this file mirrors the
+ 14. A search that returns nothing usable stops the topic instead of letting the
+     model summarise an error message.
+ 15. The notebook defines every function it calls -- this file mirrors the
      notebook rather than importing it, so a helper deleted from the notebook
      would otherwise go unnoticed here.
 
@@ -462,10 +464,20 @@ class FakeNoToolCallLLM:
 
 class FakeTavilyTool:
     call_log = []
+    # Set to make invoke() return this instead of real-looking results. Tavily
+    # reports some failures as a return value, so the fake must be able to too.
+    returns = None
 
     def invoke(self, query):
         FakeTavilyTool.call_log.append(query)
-        return [{"title": "Diabetes Overview", "url": "https://example.com", "content": "Diabetes is a condition...", "score": 0.9}]
+        if FakeTavilyTool.returns is not None:
+            return FakeTavilyTool.returns
+        return [{
+            "title": "Diabetes Overview",
+            "url": "https://example.com",
+            "content": "Diabetes is a condition affecting blood sugar. " * 8,
+            "score": 0.9,
+        }]
 
 
 FAKE_SUMMARY = "FAKE SUMMARY: Diabetes is a chronic condition affecting blood sugar. " * 3
@@ -637,6 +649,13 @@ def format_search_results(results) -> tuple[str, list[str]]:
     return "\n\n---\n\n".join(blocks), sources
 
 
+MIN_USEFUL_SEARCH_CHARS = 200
+
+
+def search_looks_usable(results_text: str, sources: list[str]) -> bool:
+    return bool(sources) and len(results_text.strip()) >= MIN_USEFUL_SEARCH_CHARS
+
+
 def describe_search(ai_message, queries: list[str], used_tool_call: bool) -> str:
     shown = ", ".join(f"`{query}`" for query in queries)
     plural = "query" if len(queries) == 1 else "queries"
@@ -674,19 +693,37 @@ def search_topic(state: HealthBotState) -> HealthBotUpdate:
 
     for call in calls:
         query = call["args"].get("query", topic)
-        queries.append(query)
         results = invoke_tool(tavily_tool, query)
         results_text, urls = format_search_results(results)
+
+        if not search_looks_usable(results_text, urls) and query != topic:
+            results = invoke_tool(tavily_tool, topic)
+            results_text, urls = format_search_results(results)
+            query = topic
+
+        queries.append(query)
         sources.extend(urls)
         tool_messages.append(ToolMessage(content=results_text, tool_call_id=call["id"]))
 
     render_markdown(describe_search(ai_message, queries, used_tool_call))
 
+    unique_sources = list(dict.fromkeys(sources))
+    search_results_text = "\n\n".join(tm.content for tm in tool_messages)
+
+    if not search_looks_usable(search_results_text, unique_sources):
+        raise HealthBotServiceError(
+            f"The search for {topic!r} returned nothing usable, so there is no "
+            f"material to summarise.\n  Tavily said: "
+            f"{redact(search_results_text.strip()[:180]) or '(empty response)'}\n"
+            "  A 432 here means the Tavily plan limit is used up. Check your key and "
+            "usage at https://app.tavily.com, then try again."
+        )
+
     return {
-        "search_results": "\n\n".join(tm.content for tm in tool_messages),
+        "search_results": search_results_text,
         "search_queries": queries,
         "search_used_tool_call": used_tool_call,
-        "search_sources": list(dict.fromkeys(sources)),
+        "search_sources": unique_sources,
         "messages": [ai_message, *tool_messages],
     }
 
@@ -1032,7 +1069,7 @@ captured_output = io.StringIO()
 
 
 def run_test(scripted_inputs, use_fallback=False, structured=True,
-             grade="B", citations=None):
+             grade="B", citations=None, tavily_returns=None):
     global llm_with_tavily, captured_output, _get_model, _active_provider, FAILOVER_ORDER
     llm_with_tavily = FakeNoToolCallLLM() if use_fallback else FakeToolCallLLM()
 
@@ -1054,6 +1091,7 @@ def run_test(scripted_inputs, use_fallback=False, structured=True,
 
     visited_nodes.clear()
     FakeTavilyTool.call_log.clear()
+    FakeTavilyTool.returns = tavily_returns
     FakeGenericLLM.payloads.clear()
     SESSION_LOG.clear()
     captured_output = io.StringIO()
@@ -1733,7 +1771,50 @@ def main():
     print("      the log never enters a prompt, and an empty log renders nothing.\n")
 
     print("=" * 70)
-    print("TEST 16: the notebook defines everything it calls")
+    print("TEST 16: a failed search refuses instead of teaching nonsense")
+    print("=" * 70)
+    # Tavily returns some failures as a value, not an exception, so invoke_tool's
+    # retry never fires. Before this check the error string flowed into the summary
+    # prompt, the model wrote "I cannot generate the summary...", and the quiz and
+    # grade were then built on that apology -- with citation verification passing,
+    # because the apology *was* the summary.
+    tavily_432 = "HTTPError('432 Client Error:  for url: https://api.tavily.com/search')"
+
+    for label, payload in [
+        ("HTTP 432 error string", tavily_432),
+        ("empty list", []),
+        ("results with no URLs", [{"title": "x", "content": "y" * 400}]),
+        ("results too short to use", [{"title": "x", "url": "https://a", "content": "tiny"}]),
+    ]:
+        try:
+            run_test(["diabetes", "", "an answer", "no"], tavily_returns=payload)
+        except HealthBotServiceError as error:
+            assert "returned nothing usable" in str(error), str(error)
+            assert "diabetes" in str(error), "the topic should be named"
+        else:
+            raise AssertionError(f"{label}: expected the search to be refused")
+        assert "summarize_results" not in visited_nodes, \
+            f"{label}: reached the summary despite having nothing to summarise"
+        assert "grade_answer" not in visited_nodes, f"{label}: graded a non-existent lesson"
+
+    # The 432 case should say what to do about it.
+    try:
+        run_test(["diabetes", "", "an answer", "no"], tavily_returns=tavily_432)
+    except HealthBotServiceError as error:
+        assert "432" in str(error) and "app.tavily.com" in str(error), str(error)
+
+    # A narrow query that returns nothing is retried on the bare topic first.
+    FakeTavilyTool.call_log.clear()
+    final_state = run_test(["diabetes", "", "it affects blood sugar", "no"])
+    assert final_state["grade"] == "B", "a healthy search must still work end to end"
+    assert search_looks_usable("x" * 300, ["[A](https://a)"])
+    assert not search_looks_usable("x" * 300, [])
+    assert not search_looks_usable("short", ["[A](https://a)"])
+    print("PASS: empty, error-shaped and URL-less results all stop the topic with a")
+    print("      readable message, and a healthy search still runs through.\n")
+
+    print("=" * 70)
+    print("TEST 17: the notebook defines everything it calls")
     print("=" * 70)
     # This file mirrors the notebook rather than importing it, so a helper deleted
     # from the notebook can still be present here and every other test will pass
